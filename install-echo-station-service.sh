@@ -17,6 +17,16 @@ if [[ ! -f "${TEMPLATE}" ]]; then
   exit 1
 fi
 
+ENV_EXAMPLE="${ECHO_RPI}/echo-station.env.example"
+ENV_TARGET="/etc/echo-station.env"
+if [[ -f "${ENV_EXAMPLE}" ]] && [[ ! -f "${ENV_TARGET}" ]]; then
+  echo "Creating ${ENV_TARGET} from echo-station.env.example (edit secrets, then restart)"
+  sudo cp "${ENV_EXAMPLE}" "${ENV_TARGET}"
+  sudo chmod 600 "${ENV_TARGET}"
+elif [[ ! -f "${ENV_TARGET}" ]]; then
+  echo "Note: no ${ENV_TARGET} — cloud ingest disabled until you create it (see echo-station.env.example)"
+fi
+
 tmp="$(mktemp)"
 sed "s|@ECHO_RPI@|${ECHO_RPI}|g" "${TEMPLATE}" >"${tmp}"
 

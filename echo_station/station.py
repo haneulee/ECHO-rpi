@@ -20,10 +20,21 @@ except ImportError:
     print("ERROR: GLib not found. Install with: sudo apt-get install libglib2.0-dev")
     sys.exit(1)
 
-from .config import LOG_DIR, LOG_LEVEL, LOG_FILE, STATION_NAMES
+from .config import (
+    LOG_DIR,
+    LOG_LEVEL,
+    LOG_FILE,
+    STATION_NAMES,
+    ECHO_APP_URL,
+    ECHO_INGEST_SECRET,
+    ECHO_SOUND_PROFILE_ID,
+    ECHO_INGEST_TIMEOUT_SEC,
+)
 from .ble_server import BLEServer
 from .upload_handler import UploadHandler
 from .csv_manager import CSVManager
+from .csv_to_encounters import csv_file_to_encounters, resolve_device_id
+from .cloud_ingest import post_encounters
 
 
 def setup_logging(log_level=LOG_LEVEL, log_file=LOG_FILE, log_to_file=True):
@@ -105,6 +116,16 @@ class EchoStation:
         signal.signal(signal.SIGTERM, self._signal_handler)
 
         self.logger.info("Station setup complete")
+        if ECHO_APP_URL and ECHO_INGEST_SECRET:
+            self.logger.info(
+                "Cloud ingest enabled → %s/api/ingest/encounters",
+                ECHO_APP_URL,
+            )
+        elif ECHO_APP_URL or ECHO_INGEST_SECRET:
+            self.logger.warning(
+                "Cloud ingest partially configured: set both ECHO_APP_URL and "
+                "ECHO_INGEST_SECRET to enable POST after each upload."
+            )
         return True
 
     def _complete_ble_setup(self) -> bool:
@@ -163,6 +184,67 @@ class EchoStation:
             f"  File: {summary.get('filename', 'unknown')}\n"
             f"  Duration: {summary.get('duration_seconds', 0):.1f}s"
         )
+        self._maybe_post_cloud_ingest(summary)
+
+    def _maybe_post_cloud_ingest(self, summary: dict) -> None:
+        if not ECHO_APP_URL or not ECHO_INGEST_SECRET:
+            return
+        fp = summary.get("filepath")
+        if not fp:
+            self.logger.info("Cloud ingest skipped: no CSV file for this session")
+            return
+        path = Path(fp)
+        if not path.is_file():
+            self.logger.warning("Cloud ingest skipped: missing file %s", path)
+            return
+
+        meta = summary.get("upload_metadata")
+        if not isinstance(meta, dict):
+            meta = None
+
+        ble_name = summary.get("device_name")
+        try:
+            device_id = resolve_device_id(meta, ble_name)
+        except ValueError as e:
+            self.logger.error("Cloud ingest: bad device id — %s", e)
+            return
+
+        session_start = summary.get("session_start")
+        session_end = summary.get("session_end")
+        if not isinstance(session_start, datetime) or not isinstance(session_end, datetime):
+            self.logger.error("Cloud ingest: missing session wall times")
+            return
+
+        try:
+            encounters = csv_file_to_encounters(
+                path,
+                device_id=device_id,
+                session_start=session_start,
+                session_end=session_end,
+                sound_profile_id=ECHO_SOUND_PROFILE_ID,
+            )
+        except Exception as e:
+            self.logger.exception("Cloud ingest: failed to build encounters: %s", e)
+            return
+
+        if not encounters:
+            self.logger.info("Cloud ingest: no encounter sessions in CSV — nothing to POST")
+            return
+
+        try:
+            resp = post_encounters(
+                ECHO_APP_URL,
+                ECHO_INGEST_SECRET,
+                encounters,
+                timeout_sec=ECHO_INGEST_TIMEOUT_SEC,
+            )
+            self.logger.info(
+                "Cloud ingest OK: posted %d encounter(s) — %s",
+                len(encounters),
+                resp,
+            )
+        except Exception as e:
+            self.logger.error("Cloud ingest failed: %s", e)
 
     def _on_error(self, device_name: str, error: str, **kwargs):
         """Error occurred during upload"""

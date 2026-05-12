@@ -67,3 +67,18 @@ LOG_FILE = LOG_DIR / "station.log"
 
 MAX_CONCURRENT_UPLOADS = 1
 CONNECTION_TIMEOUT = 60  # seconds
+
+# =====================================================
+# CLOUD INGEST (optional — POST to Next.js after each upload)
+# =====================================================
+
+# Base URL, e.g. https://your-app.vercel.app (no trailing slash)
+ECHO_APP_URL = os.environ.get("ECHO_APP_URL", "").strip().rstrip("/")
+# Same value as server INGEST_SECRET (Bearer token)
+ECHO_INGEST_SECRET = os.environ.get("ECHO_INGEST_SECRET", "").strip()
+# Seeded SoundProfile id in the web DB
+ECHO_SOUND_PROFILE_ID = os.environ.get(
+    "ECHO_SOUND_PROFILE_ID",
+    "ambient3_meditation_v1",
+).strip()
+ECHO_INGEST_TIMEOUT_SEC = float(os.environ.get("ECHO_INGEST_TIMEOUT_SEC", "60"))

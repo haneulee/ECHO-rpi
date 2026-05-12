@@ -186,17 +186,51 @@ The ECHO upload protocol follows this sequence:
 
 1. **ECHO device connects** to the BLE GATT server
 2. **Device sends**: `BEGIN_UPLOAD` marker
-3. **Device sends**: CSV data lines (one per write operation)
-4. **Device sends**: `END_UPLOAD` marker
-5. **Server finalizes** CSV file and logs summary
-6. **Connection closes**
+3. **Device sends** (recommended): one line `ECHO_JSON_META:` + JSON object with `echoUnitCode` (web signup / `EchoDevice.id`), `bleDeviceName` (`MY_NAME`), and `echoModelType` (`shy` \| `messy` \| `bounce`). This line is **not** written to the CSV file.
+4. **Device sends**: CSV data lines (one per write operation)
+5. **Device sends**: `END_UPLOAD` marker
+6. **Server finalizes** CSV file, logs summary, and (if configured) **POST**s derived encounters to the Next.js ingest API
+7. **Connection closes**
 
 The server handles:
 - **Multi-device uploads**: Each device gets its own session and CSV file
 - **Concurrent uploads**: Sequential processing (one at a time)
 - **Malformed data**: Skipped lines logged as warnings; upload continues
-- **Timeouts**: Sessions > 30s are cleaned up automatically
+- **Timeouts**: Sessions use a very long timeout (see `config.py`); practical unlimited for dock uploads
 - **Mid-upload disconnects**: Graceful cleanup; partial data preserved
+
+## Cloud database ingest (optional)
+
+After each successful upload, the station can **POST** JSON encounters to your deployed Next.js app (`POST /api/ingest/encounters`) using the same contract as your web backend (Bearer `INGEST_SECRET`).
+
+### Environment variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `ECHO_APP_URL` | with ingest | Base URL, e.g. `https://your-app.vercel.app` (no trailing slash) |
+| `ECHO_INGEST_SECRET` | with ingest | Same value as server `INGEST_SECRET` |
+| `ECHO_SOUND_PROFILE_ID` | no | Defaults to `ambient3_meditation_v1` |
+| `ECHO_INGEST_TIMEOUT_SEC` | no | HTTP timeout (default `60`) |
+
+If either `ECHO_APP_URL` or `ECHO_INGEST_SECRET` is missing, cloud ingest is skipped (local CSV only).
+
+### systemd (recommended)
+
+The unit file includes `EnvironmentFile=-/etc/echo-station.env`. **`./install-echo-station-service.sh`** copies `echo-station.env.example` to `/etc/echo-station.env` **only if that file does not exist** (then edit secrets). You can also create it manually (root-readable only):
+
+```
+ECHO_APP_URL=https://your-app.vercel.app
+ECHO_INGEST_SECRET=your-ingest-secret
+```
+
+Then `sudo systemctl restart echo-station.service`.
+
+Re-run `./install-echo-station-service.sh` after pulling changes so the updated unit file is installed.
+
+### Behaviour
+
+- CSV rows are grouped into **seen → lost** sessions per `(device_name, target)` and mapped to the ingest **Encounter** shape (`proximityZone`, ISO timestamps from the upload session window on the Pi, deterministic `id` for upsert-friendly retries).
+- **`deviceId`** sent to the API is `echoUnitCode` from `ECHO_JSON_META` (normalized), or the CSV `device_name` if metadata is absent.
 
 ## Project Structure
 
@@ -206,6 +240,9 @@ ECHO-rpi/
 │   ├── __init__.py              # Package definition
 │   ├── config.py                # Configuration constants
 │   ├── csv_manager.py           # File I/O and CSV handling
+│   ├── csv_to_encounters.py     # CSV → ingest Encounter JSON
+│   ├── cloud_ingest.py          # HTTPS POST to /api/ingest/encounters
+│   ├── echo_unit_code.py        # Normalize unit codes (match web app)
 │   ├── upload_handler.py        # Protocol state machine
 │   ├── ble_server.py            # BlueZ GATT server
 │   └── station.py               # Main application
@@ -242,7 +279,7 @@ BlueZ integration via DBus:
 ### `station.py`
 Main application:
 - Initializes all components
-- Sets up event callbacks
+- Sets up event callbacks; after each upload may POST encounters to the cloud when `ECHO_APP_URL` and `ECHO_INGEST_SECRET` are set
 - Runs async GLib event loop
 - Handles graceful shutdown
 

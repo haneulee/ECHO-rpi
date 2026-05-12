@@ -5,7 +5,8 @@ Upload Handler - Manages the ECHO device upload protocol state machine
 from enum import Enum
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional, List
+from typing import Any, Callable, Dict, Optional, List
+import json
 import logging
 import re
 import uuid
@@ -14,6 +15,8 @@ from .config import UPLOAD_BEGIN_MARKER, UPLOAD_END_MARKER, UPLOAD_SESSION_TIMEO
 from .csv_manager import CSVManager
 
 logger = logging.getLogger(__name__)
+
+META_PREFIX = "ECHO_JSON_META:"
 
 # Second column of encounter.csv lines: logging device (MY_NAME on ESP)
 _ECHO_NAME_RE = re.compile(r"^ECHO_[A-Za-z0-9_\-]{1,48}$")
@@ -52,6 +55,7 @@ class UploadSession:
         self.error_count = 0
         self.skipped_lines = []
         self.source_device_name: Optional[str] = None
+        self.metadata: Optional[Dict[str, Any]] = None
 
     def start(self) -> bool:
         """Begin upload session; CSV file is created on first valid data row (ESP device name)."""
@@ -59,6 +63,11 @@ class UploadSession:
             self.state = UploadState.RECEIVING
             self.start_time = datetime.now()
             self.filepath = None
+            self.row_count = 0
+            self.error_count = 0
+            self.skipped_lines = []
+            self.source_device_name = None
+            self.metadata = None
             logger.info(
                 f"[Session {self.session_id}] Upload session open "
                 f"(link={self.device_name!r}, file after first row)"
@@ -79,6 +88,29 @@ class UploadSession:
                 f"[Session {self.session_id}] Received data outside RECEIVING state"
             )
             return False
+
+        stripped = line.strip()
+        if stripped.startswith(META_PREFIX):
+            payload = stripped[len(META_PREFIX) :].strip()
+            try:
+                parsed = json.loads(payload)
+                if isinstance(parsed, dict):
+                    self.metadata = parsed
+                    logger.info(
+                        f"[Session {self.session_id}] Parsed upload metadata keys: "
+                        f"{list(self.metadata.keys())}"
+                    )
+                else:
+                    logger.warning(
+                        f"[Session {self.session_id}] Metadata JSON must be an object"
+                    )
+                    self.error_count += 1
+            except json.JSONDecodeError as e:
+                logger.warning(
+                    f"[Session {self.session_id}] Invalid JSON metadata: {e}"
+                )
+                self.error_count += 1
+            return True
 
         # Validate CSV format
         if not self.csv_manager.validate_csv_line(line):
@@ -140,6 +172,9 @@ class UploadSession:
             "duration_seconds": duration,
             "errors": self.error_count,
             "skipped_lines": len(self.skipped_lines),
+            "upload_metadata": self.metadata,
+            "session_start": self.start_time,
+            "session_end": self.end_time,
         })
 
         logger.info(
