@@ -1,0 +1,18 @@
+[Unit]
+Description=ECHO BLE encounter station (GATT server)
+After=bluetooth.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+WorkingDirectory=@ECHO_RPI@
+# Root: BlueZ GATT / hci0 D-Bus access on stock Raspberry Pi OS
+ExecStart=@ECHO_RPI@/.venv/bin/python3 @ECHO_RPI@/run_station.py
+Restart=on-failure
+RestartSec=10
+User=root
+Group=root
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

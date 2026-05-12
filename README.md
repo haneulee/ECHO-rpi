@@ -65,7 +65,7 @@ Edit [echo_station/config.py](echo_station/config.py) to customize:
 - **SERVICE_UUID** and **CHARACTERISTIC_UUID**: GATT identifiers (hardcoded to match ESP32)
 - **LOG_DIR**: Output directory for CSV files (default: `./logs/`)
 - **LOG_LEVEL**: Verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`)
-- **UPLOAD_SESSION_TIMEOUT**: Max duration for a single upload (default: 30s)
+- **UPLOAD_SESSION_TIMEOUT**: Maximum duration (seconds) for a single upload session; default is set very high so uploads rarely time out
 
 ## Usage
 
@@ -115,6 +115,52 @@ Final stats:
 
 ECHO Station stopped
 ```
+
+## Run on boot (Raspberry Pi)
+
+You can register a **systemd** service so the station starts automatically after power-on—no need to start it manually each time.
+
+### Prerequisites
+
+- A **Python virtual environment** at `.venv` under `ECHO-rpi`. If you do not have one yet:
+  ```bash
+  cd ~/Documents/echo/ECHO-rpi
+  python3 -m venv .venv --system-site-packages
+  sudo apt-get install -y python3-gi gir1.2-glib-2.0
+  .venv/bin/pip install -r requirements.txt
+  ```
+- The service runs as **root**, same as running the station with `sudo` for BlueZ / Bluetooth access.
+
+### One-time install
+
+On the Raspberry Pi:
+
+```bash
+cd ~/Documents/echo/ECHO-rpi
+./install-echo-station-service.sh
+```
+
+Enter your `sudo` password when prompted. After that, the station will start **on every boot**.
+
+### Check that it is running
+
+```bash
+sudo systemctl status echo-station.service
+```
+
+Follow logs:
+
+```bash
+sudo journalctl -u echo-station.service -f
+```
+
+### Disable auto-start
+
+```bash
+sudo systemctl disable --now echo-station.service
+```
+
+If you move the project to a different path, run `./install-echo-station-service.sh` again **from the new directory** so the unit file is regenerated with the correct paths.
 
 ## CSV Output Format
 
