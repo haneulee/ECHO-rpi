@@ -89,6 +89,7 @@ class EchoStation:
         self.main_loop = None
         self.sound_web_server = None
         self.running = False
+        self.startup_failed = False
 
     def setup(self) -> bool:
         """Initialize all components"""
@@ -160,6 +161,7 @@ class EchoStation:
 
         def on_error(err: Exception):
             self.logger.error("Failed to register GATT application with BlueZ: %s", err)
+            self.startup_failed = True
             self.main_loop.quit()
 
         self.ble_server.register_application_async(on_gatt_ok, on_error)
@@ -168,6 +170,7 @@ class EchoStation:
     def _on_le_advertising_done(self, ok: bool):
         if not ok:
             self.logger.error("Failed to start BLE LE advertising")
+            self.startup_failed = True
             self.main_loop.quit()
             return
         self.running = True
@@ -386,6 +389,8 @@ class EchoStation:
 
     def start(self):
         """Start the station"""
+        self.startup_failed = False
+
         if not self.setup():
             self.logger.error("Failed to setup station")
             return False
@@ -399,6 +404,8 @@ class EchoStation:
         except KeyboardInterrupt:
             self.logger.info("Interrupted by user")
             self.stop()
+
+        return not self.startup_failed
 
     def _cleanup_timer(self):
         """Periodic cleanup of expired sessions"""
@@ -450,7 +457,8 @@ def main():
 
     # Create and start station
     station = EchoStation()
-    station.start()
+    if not station.start():
+        sys.exit(1)
 
 
 if __name__ == "__main__":

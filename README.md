@@ -464,3 +464,10 @@ For issues or questions:
 2. Run with `LOG_LEVEL = "DEBUG"` in `config.py` for verbose output
 3. Verify BLE adapter is powered: `sudo hciconfig hci0 up`
 4. Check ESP32 firmware is using matching UUIDs
+
+
+---
+
+- run 'sudo systemctl restart echo-station.service' after changing code
+- run 'cd /home/echo/Documents/echo/ECHO-rpi
+./install-echo-station-service.sh' after changing service related code ( systemd/echo-station.service.in이나 install-echo-station-service.sh)
