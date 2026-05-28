@@ -3,6 +3,7 @@ CSV Manager - Handles encounter data file storage and management
 """
 
 import csv
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict
@@ -122,7 +123,6 @@ class CSVManager:
         Expected: timestamp,device_name,target,type,event,rssi,smooth_rssi,closeness
         """
         parts = line.split(",")
-        # Should have 8 fields
         if len(parts) != 8:
             logger.debug(f"Invalid CSV line format (expected 8 fields, got {len(parts)}): {line}")
             return False
@@ -133,3 +133,48 @@ class CSVManager:
         List all encounter CSV files in the log directory
         """
         return sorted(self.log_dir.glob("encounter_*.csv"), reverse=True)
+
+    def initialize_evolution_file(self, session_id: str) -> Path:
+        """Create an empty JSONL file for one BLE upload session (evolution events)."""
+        now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        safe = session_id.replace(" ", "_").replace("/", "_")
+        filename = f"evolution_{safe}_{now}.jsonl"
+        filepath = self.log_dir / filename
+        filepath.touch()
+        logger.info(f"Created evolution JSONL: {filepath}")
+        return filepath
+
+    def append_evolution_json_line(self, filepath: Path, json_line: str) -> bool:
+        """Append one JSON object per line (no outer prefix)."""
+        try:
+            with open(filepath, "a", encoding="utf-8") as f:
+                f.write(json_line.strip() + "\n")
+            return True
+        except IOError as e:
+            logger.error(f"Failed to append evolution line: {e}")
+            return False
+
+    def finalize_evolution_file(self, filepath: Path) -> Dict[str, any]:
+        try:
+            n = 0
+            if filepath.is_file():
+                with open(filepath, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if line.strip():
+                            n += 1
+            return {"rows": n, "filepath": str(filepath), "filename": filepath.name}
+        except OSError as e:
+            logger.error("finalize evolution: %s", e)
+            return {"rows": 0, "filepath": str(filepath), "error": str(e)}
+
+    def write_device_state_json(self, session_id: str, data: Dict[str, any]) -> Path:
+        """Persist one JSON object from ECHO_STATE_JSON for logs and cloud ingest."""
+        now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        safe = session_id.replace(" ", "_").replace("/", "_")
+        filename = f"echo_state_{safe}_{now}.json"
+        filepath = self.log_dir / filename
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, separators=(",", ":"), ensure_ascii=False)
+            f.write("\n")
+        logger.info("Wrote device state snapshot %s", filepath.name)
+        return filepath

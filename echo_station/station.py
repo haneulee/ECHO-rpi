@@ -29,12 +29,26 @@ from .config import (
     ECHO_INGEST_SECRET,
     ECHO_SOUND_PROFILE_ID,
     ECHO_INGEST_TIMEOUT_SEC,
+    ECHO_DAILY_SOUND_ENABLED,
+    ECHO_DAILY_SOUND_AUTOPLAY,
+    ECHO_DAILY_SOUND_DURATION_SEC,
+    ECHO_DAILY_SOUND_WEB_ENABLED,
+    ECHO_SOUND_PLAY_COMMAND,
+    ECHO_SOUND_WEB_HOST,
+    ECHO_SOUND_WEB_PORT,
 )
 from .ble_server import BLEServer
 from .upload_handler import UploadHandler
 from .csv_manager import CSVManager
 from .csv_to_encounters import csv_file_to_encounters, resolve_device_id
-from .cloud_ingest import post_encounters
+from .cloud_ingest import post_encounters, post_evolutions, post_echo_state
+from .evolution_ingest import evolution_jsonl_to_payloads
+from .state_ingest import echo_state_file_to_api_payload
+from .daily_sound import (
+    play_sound_file,
+    render_daily_sound,
+    start_sound_web_server,
+)
 
 
 def setup_logging(log_level=LOG_LEVEL, log_file=LOG_FILE, log_to_file=True):
@@ -73,6 +87,7 @@ class EchoStation:
         self.upload_handler = UploadHandler(self.csv_manager)
         self.ble_server = None
         self.main_loop = None
+        self.sound_web_server = None
         self.running = False
 
     def setup(self) -> bool:
@@ -118,7 +133,7 @@ class EchoStation:
         self.logger.info("Station setup complete")
         if ECHO_APP_URL and ECHO_INGEST_SECRET:
             self.logger.info(
-                "Cloud ingest enabled → %s/api/ingest/encounters",
+                "Cloud ingest enabled → %s/api/ingest/{encounters,evolutions,echo-state}",
                 ECHO_APP_URL,
             )
         elif ECHO_APP_URL or ECHO_INGEST_SECRET:
@@ -126,6 +141,15 @@ class EchoStation:
                 "Cloud ingest partially configured: set both ECHO_APP_URL and "
                 "ECHO_INGEST_SECRET to enable POST after each upload."
             )
+        if ECHO_DAILY_SOUND_WEB_ENABLED:
+            try:
+                self.sound_web_server = start_sound_web_server(
+                    ECHO_SOUND_WEB_HOST,
+                    ECHO_SOUND_WEB_PORT,
+                    log=self.logger,
+                )
+            except OSError as e:
+                self.logger.error("Daily sound web server failed to start: %s", e)
         return True
 
     def _complete_ble_setup(self) -> bool:
@@ -182,20 +206,74 @@ class EchoStation:
             f"[{session_id}] Upload complete from {device_name}\n"
             f"  Rows saved: {summary.get('rows_saved', 0)}\n"
             f"  File: {summary.get('filename', 'unknown')}\n"
+            f"  Evolution: {summary.get('evolution_rows', 0)} row(s)"
+            f" → {summary.get('evolution_filename') or 'none'}\n"
+            f"  State: {summary.get('state_filepath') or 'none'}\n"
             f"  Duration: {summary.get('duration_seconds', 0):.1f}s"
         )
         self._maybe_post_cloud_ingest(summary)
+        self._maybe_render_daily_sound(summary)
+
+    def _maybe_render_daily_sound(self, summary: dict) -> None:
+        if not ECHO_DAILY_SOUND_ENABLED:
+            return
+
+        rows_saved = int(summary.get("rows_saved", 0) or 0)
+        if rows_saved <= 0:
+            self.logger.info("Daily sound skipped: upload had no encounter rows")
+            return
+
+        try:
+            result = render_daily_sound(duration_sec=ECHO_DAILY_SOUND_DURATION_SEC)
+        except Exception as e:
+            self.logger.exception("Daily sound render failed: %s", e)
+            return
+
+        if not result:
+            self.logger.info("Daily sound skipped: no encounter rows found for today")
+            return
+
+        self.logger.info(
+            "Daily sound rendered: %s (%d row(s), avg closeness %.2f)",
+            result.today_path,
+            result.rows_used,
+            result.avg_closeness,
+        )
+
+        if ECHO_DAILY_SOUND_AUTOPLAY:
+            play_sound_file(
+                result.today_path,
+                command_template=ECHO_SOUND_PLAY_COMMAND,
+                log=self.logger,
+            )
 
     def _maybe_post_cloud_ingest(self, summary: dict) -> None:
         if not ECHO_APP_URL or not ECHO_INGEST_SECRET:
             return
-        fp = summary.get("filepath")
-        if not fp:
-            self.logger.info("Cloud ingest skipped: no CSV file for this session")
+
+        fp = (summary.get("filepath") or "").strip()
+        evo_fp = summary.get("evolution_filepath")
+        state_fp = (summary.get("state_filepath") or "").strip()
+        if not fp and not evo_fp and not state_fp:
+            self.logger.info("Cloud ingest skipped: no CSV, evolution, or state file")
             return
-        path = Path(fp)
-        if not path.is_file():
-            self.logger.warning("Cloud ingest skipped: missing file %s", path)
+
+        enc_path = Path(fp) if fp else None
+        if enc_path and not enc_path.is_file():
+            self.logger.warning("Cloud ingest: encounter file missing %s", enc_path)
+            enc_path = None
+
+        evo_path = Path(evo_fp) if evo_fp else None
+        if evo_path and not evo_path.is_file():
+            self.logger.warning("Cloud ingest: evolution file missing %s", evo_path)
+            evo_path = None
+
+        state_path = Path(state_fp) if state_fp else None
+        if state_path and not state_path.is_file():
+            self.logger.warning("Cloud ingest: state file missing %s", state_path)
+            state_path = None
+
+        if not enc_path and not evo_path and not state_path:
             return
 
         meta = summary.get("upload_metadata")
@@ -203,6 +281,8 @@ class EchoStation:
             meta = None
 
         ble_name = summary.get("device_name")
+        if meta and isinstance(meta.get("bleDeviceName"), str) and meta["bleDeviceName"].strip():
+            ble_name = meta["bleDeviceName"].strip()
         try:
             device_id = resolve_device_id(meta, ble_name)
         except ValueError as e:
@@ -215,36 +295,85 @@ class EchoStation:
             self.logger.error("Cloud ingest: missing session wall times")
             return
 
-        try:
-            encounters = csv_file_to_encounters(
-                path,
-                device_id=device_id,
-                session_start=session_start,
-                session_end=session_end,
-                sound_profile_id=ECHO_SOUND_PROFILE_ID,
-            )
-        except Exception as e:
-            self.logger.exception("Cloud ingest: failed to build encounters: %s", e)
-            return
+        encounters: list = []
+        if enc_path:
+            try:
+                encounters = csv_file_to_encounters(
+                    enc_path,
+                    device_id=device_id,
+                    session_start=session_start,
+                    session_end=session_end,
+                    sound_profile_id=ECHO_SOUND_PROFILE_ID,
+                )
+            except Exception as e:
+                self.logger.exception("Cloud ingest: failed to build encounters: %s", e)
 
-        if not encounters:
-            self.logger.info("Cloud ingest: no encounter sessions in CSV — nothing to POST")
-            return
+        if encounters:
+            try:
+                resp = post_encounters(
+                    ECHO_APP_URL,
+                    ECHO_INGEST_SECRET,
+                    encounters,
+                    timeout_sec=ECHO_INGEST_TIMEOUT_SEC,
+                )
+                self.logger.info(
+                    "Cloud ingest OK: posted %d encounter(s) — %s",
+                    len(encounters),
+                    resp,
+                )
+            except Exception as e:
+                self.logger.error("Cloud ingest (encounters) failed: %s", e)
+        else:
+            self.logger.info("Cloud ingest: no encounter sessions to POST")
 
-        try:
-            resp = post_encounters(
-                ECHO_APP_URL,
-                ECHO_INGEST_SECRET,
-                encounters,
-                timeout_sec=ECHO_INGEST_TIMEOUT_SEC,
-            )
-            self.logger.info(
-                "Cloud ingest OK: posted %d encounter(s) — %s",
-                len(encounters),
-                resp,
-            )
-        except Exception as e:
-            self.logger.error("Cloud ingest failed: %s", e)
+        if evo_path and summary.get("evolution_rows", 0) > 0:
+            try:
+                evolutions = evolution_jsonl_to_payloads(
+                    evo_path,
+                    device_id=device_id,
+                    session_start=session_start,
+                    session_end=session_end,
+                    encounter_csv=enc_path,
+                )
+            except Exception as e:
+                self.logger.exception("Cloud ingest: failed to build evolutions: %s", e)
+                evolutions = []
+            if evolutions:
+                try:
+                    eresp = post_evolutions(
+                        ECHO_APP_URL,
+                        ECHO_INGEST_SECRET,
+                        evolutions,
+                        timeout_sec=ECHO_INGEST_TIMEOUT_SEC,
+                    )
+                    self.logger.info(
+                        "Cloud evolution ingest OK: posted %d — %s",
+                        len(evolutions),
+                        eresp,
+                    )
+                except Exception as e:
+                    self.logger.error("Cloud ingest (evolutions) failed: %s", e)
+            else:
+                self.logger.info("Cloud ingest: evolution file produced no payloads")
+
+        if state_path:
+            try:
+                st_payload = echo_state_file_to_api_payload(
+                    state_path,
+                    device_id=device_id,
+                    session_start=session_start,
+                    session_end=session_end,
+                    sound_profile_id=ECHO_SOUND_PROFILE_ID,
+                )
+                sresp = post_echo_state(
+                    ECHO_APP_URL,
+                    ECHO_INGEST_SECRET,
+                    st_payload,
+                    timeout_sec=ECHO_INGEST_TIMEOUT_SEC,
+                )
+                self.logger.info("Cloud echo-state ingest OK — %s", sresp)
+            except Exception as e:
+                self.logger.error("Cloud ingest (echo-state) failed: %s", e)
 
     def _on_error(self, device_name: str, error: str, **kwargs):
         """Error occurred during upload"""
@@ -294,6 +423,11 @@ class EchoStation:
 
         if self.ble_server:
             self.ble_server.stop()
+
+        if self.sound_web_server:
+            self.sound_web_server.shutdown()
+            self.sound_web_server.server_close()
+            self.sound_web_server = None
 
         if self.main_loop:
             self.main_loop.quit()

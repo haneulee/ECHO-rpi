@@ -9,6 +9,9 @@ A Python BLE GATT server that listens for ECHO ESP32 personality devices to uplo
 - Advertises a GATT service over BLE
 - Receives CSV-formatted encounter logs from ECHO devices
 - Saves data to timestamped CSV files in the `logs/` directory
+- Renders a "today's sound" WAV from the day's encounter data after each upload
+- Optionally auto-plays the sound through the Pi's default audio output
+- Serves the latest daily sound at a local browser URL
 - Handles multi-device connections and uploads
 - Provides console logging and progress tracking
 
@@ -66,6 +69,38 @@ Edit [echo_station/config.py](echo_station/config.py) to customize:
 - **LOG_DIR**: Output directory for CSV files (default: `./logs/`)
 - **LOG_LEVEL**: Verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`)
 - **UPLOAD_SESSION_TIMEOUT**: Maximum duration (seconds) for a single upload session; default is set very high so uploads rarely time out
+
+## Today's Sound Playback
+
+After an ESP32 finishes a dock upload with encounter rows, the station rebuilds a deterministic WAV from all of today's `encounter_*.csv` files:
+
+- File output: `sounds/today.wav` and `sounds/daily_echo_YYYY-MM-DD.wav`
+- Browser player: `http://<raspberry-pi-ip>:8765/`
+- Raw audio URL: `http://<raspberry-pi-ip>:8765/today.wav`
+- API status: `http://<raspberry-pi-ip>:8765/api/today-sound`
+
+For automatic playback, pair/connect the Bluetooth speaker on Raspberry Pi OS and make it the default audio output. The station tries `paplay`, then `pw-play`, then `aplay`. If your speaker needs a specific command, set:
+
+```bash
+ECHO_SOUND_PLAY_COMMAND=paplay {path}
+```
+
+Useful optional settings in `/etc/echo-station.env`:
+
+```bash
+ECHO_DAILY_SOUND_ENABLED=true
+ECHO_DAILY_SOUND_AUTOPLAY=true
+ECHO_DAILY_SOUND_DURATION_SEC=45
+ECHO_DAILY_SOUND_WEB_ENABLED=true
+ECHO_SOUND_WEB_HOST=0.0.0.0
+ECHO_SOUND_WEB_PORT=8765
+```
+
+Restart the service after changing these values:
+
+```bash
+sudo systemctl restart echo-station.service
+```
 
 ## Usage
 
@@ -187,10 +222,12 @@ The ECHO upload protocol follows this sequence:
 1. **ECHO device connects** to the BLE GATT server
 2. **Device sends**: `BEGIN_UPLOAD` marker
 3. **Device sends** (recommended): one line `ECHO_JSON_META:` + JSON object with `echoUnitCode` (web signup / `EchoDevice.id`), `bleDeviceName` (`MY_NAME`), and `echoModelType` (`shy` \| `messy` \| `bounce`). This line is **not** written to the CSV file.
-4. **Device sends**: CSV data lines (one per write operation)
-5. **Device sends**: `END_UPLOAD` marker
-6. **Server finalizes** CSV file, logs summary, and (if configured) **POST**s derived encounters to the Next.js ingest API
-7. **Connection closes**
+4. **Device sends** (recommended): `ECHO_STATE_JSON:` + JSON snapshot (`profileSnapshot`, `soundProfileId`, …) — not written to the encounter CSV
+5. **Device sends** (optional): CSV data lines (one per write operation) when encounter data exists
+6. **Device sends** (optional): `ECHO_EVOLUTION_JSON:` + one JSON object per evolution event (not written to the encounter CSV)
+7. **Device sends**: `END_UPLOAD` marker
+8. **Server finalizes** encounter CSV, evolution JSONL, and state JSON (if any), logs summary, and (if configured) **POST**s to the Next.js ingest API
+9. **Connection closes**
 
 The server handles:
 - **Multi-device uploads**: Each device gets its own session and CSV file
@@ -201,7 +238,7 @@ The server handles:
 
 ## Cloud database ingest (optional)
 
-After each successful upload, the station can **POST** JSON encounters to your deployed Next.js app (`POST /api/ingest/encounters`) using the same contract as your web backend (Bearer `INGEST_SECRET`).
+After each successful upload, the station can **POST** JSON encounters (`POST /api/ingest/encounters`), evolution rows (`POST /api/ingest/evolutions`), and device echo state (`POST /api/ingest/echo-state`) to your deployed Next.js app, using the same Bearer `INGEST_SECRET` as your web backend.
 
 ### Environment variables
 
@@ -229,8 +266,8 @@ Re-run `./install-echo-station-service.sh` after pulling changes so the updated 
 
 ### Behaviour
 
-- CSV rows are grouped into **seen → lost** sessions per `(device_name, target)` and mapped to the ingest **Encounter** shape (`proximityZone`, ISO timestamps from the upload session window on the Pi, deterministic `id` for upsert-friendly retries).
-- **`deviceId`** sent to the API is `echoUnitCode` from `ECHO_JSON_META` (normalized), or the CSV `device_name` if metadata is absent.
+- CSV rows are grouped into **seen → lost** sessions per `(device_name, target)` and mapped to the ingest **Encounter** shape (`proximityZone`, `otherEchoModelName` from `target`, ISO timestamps from the upload session window on the Pi, deterministic `id` for upsert-friendly retries).
+- Evolution JSONL lines are forwarded as **`POST /api/ingest/evolutions`** (implement this route on the Next app if missing; same `INGEST_SECRET`).
 
 ## Project Structure
 
@@ -241,7 +278,9 @@ ECHO-rpi/
 │   ├── config.py                # Configuration constants
 │   ├── csv_manager.py           # File I/O and CSV handling
 │   ├── csv_to_encounters.py     # CSV → ingest Encounter JSON
-│   ├── cloud_ingest.py          # HTTPS POST to /api/ingest/encounters
+│   ├── cloud_ingest.py          # HTTPS POST ingest (encounters + evolutions)
+│   ├── daily_sound.py           # Today's WAV render, autoplay, and web playback
+│   ├── evolution_ingest.py      # evolution.jsonl → API payloads
 │   ├── echo_unit_code.py        # Normalize unit codes (match web app)
 │   ├── upload_handler.py        # Protocol state machine
 │   ├── ble_server.py            # BlueZ GATT server

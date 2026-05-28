@@ -17,6 +17,17 @@ from .csv_manager import CSVManager
 logger = logging.getLogger(__name__)
 
 META_PREFIX = "ECHO_JSON_META:"
+EVO_PREFIX = "ECHO_EVOLUTION_JSON:"
+STATE_PREFIX = "ECHO_STATE_JSON:"
+
+# Some BLE→text paths prepend BOM/NUL/zero-width chars so the line *looks* like
+# "ECHO_EVOLUTION_JSON:..." in logs but startswith(EVO_PREFIX) fails → "Skipped malformed line".
+_BLE_LINE_LEADING_JUNK = "\ufeff\x00\u200b\u200c\u200d\u2060"
+
+
+def normalize_ble_upload_text(s: str) -> str:
+    return s.strip().lstrip(_BLE_LINE_LEADING_JUNK)
+
 
 # Second column of encounter.csv lines: logging device (MY_NAME on ESP)
 _ECHO_NAME_RE = re.compile(r"^ECHO_[A-Za-z0-9_\-]{1,48}$")
@@ -56,6 +67,9 @@ class UploadSession:
         self.skipped_lines = []
         self.source_device_name: Optional[str] = None
         self.metadata: Optional[Dict[str, Any]] = None
+        self.evolution_filepath: Optional[Path] = None
+        self.evolution_row_count = 0
+        self.device_state_payload: Optional[Dict[str, Any]] = None
 
     def start(self) -> bool:
         """Begin upload session; CSV file is created on first valid data row (ESP device name)."""
@@ -68,6 +82,9 @@ class UploadSession:
             self.skipped_lines = []
             self.source_device_name = None
             self.metadata = None
+            self.evolution_filepath = None
+            self.evolution_row_count = 0
+            self.device_state_payload = None
             logger.info(
                 f"[Session {self.session_id}] Upload session open "
                 f"(link={self.device_name!r}, file after first row)"
@@ -89,7 +106,7 @@ class UploadSession:
             )
             return False
 
-        stripped = line.strip()
+        stripped = normalize_ble_upload_text(line)
         if stripped.startswith(META_PREFIX):
             payload = stripped[len(META_PREFIX) :].strip()
             try:
@@ -112,12 +129,60 @@ class UploadSession:
                 self.error_count += 1
             return True
 
+        if stripped.startswith(EVO_PREFIX):
+            payload = stripped[len(EVO_PREFIX) :].strip()
+            try:
+                parsed = json.loads(payload)
+                if not isinstance(parsed, dict):
+                    raise ValueError("evolution JSON must be an object")
+            except (json.JSONDecodeError, ValueError) as e:
+                head = payload[:160].replace("\n", "\\n")
+                logger.warning(
+                    f"[Session {self.session_id}] Invalid evolution JSON (len={len(payload)}): "
+                    f"{e}; head={head!r}"
+                )
+                self.error_count += 1
+                return False
+            if self.evolution_filepath is None:
+                self.evolution_filepath = self.csv_manager.initialize_evolution_file(
+                    self.session_id
+                )
+                logger.info(
+                    f"[Session {self.session_id}] Evolution log: "
+                    f"{self.evolution_filepath.name}"
+                )
+            if self.csv_manager.append_evolution_json_line(
+                self.evolution_filepath, json.dumps(parsed, separators=(",", ":"))
+            ):
+                self.evolution_row_count += 1
+                return True
+            self.error_count += 1
+            return False
+
+        if stripped.startswith(STATE_PREFIX):
+            payload = stripped[len(STATE_PREFIX) :].strip()
+            try:
+                parsed = json.loads(payload)
+                if not isinstance(parsed, dict):
+                    raise ValueError("state JSON must be an object")
+                self.device_state_payload = parsed
+                logger.info(
+                    f"[Session {self.session_id}] Parsed device state keys: {list(parsed.keys())}"
+                )
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(
+                    f"[Session {self.session_id}] Invalid state JSON: {e}"
+                )
+                self.error_count += 1
+                return False
+            return True
+
         # Validate CSV format
-        if not self.csv_manager.validate_csv_line(line):
+        if not self.csv_manager.validate_csv_line(stripped):
             logger.warning(
-                f"[Session {self.session_id}] Skipped malformed line: {line[:80]}..."
+                f"[Session {self.session_id}] Skipped malformed line: {stripped[:80]}..."
             )
-            self.skipped_lines.append(line)
+            self.skipped_lines.append(stripped)
             self.error_count += 1
             return False
 
@@ -137,7 +202,7 @@ class UploadSession:
             )
 
         # Append to file
-        if self.csv_manager.append_data_line(self.filepath, line):
+        if self.csv_manager.append_data_line(self.filepath, stripped):
             self.row_count += 1
             return True
         else:
@@ -157,15 +222,50 @@ class UploadSession:
         self.state = UploadState.COMPLETE
         self.end_time = datetime.now()
 
-        if not self.filepath:
+        if not self.filepath and not self.evolution_filepath and not self.device_state_payload:
+            logger.warning(
+                f"[Session {self.session_id}] Upload finished with no CSV, evolution, or state"
+            )
             return {}
 
-        # Get final summary from CSV manager
-        summary = self.csv_manager.finalize_upload(self.filepath)
+        if self.filepath:
+            summary = self.csv_manager.finalize_upload(self.filepath)
+        else:
+            summary = {
+                "filepath": "",
+                "filename": "none",
+                "rows_saved": 0,
+                "file_size_bytes": 0,
+                "upload_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "success": True,
+            }
+
+        if self.evolution_filepath:
+            evo_info = self.csv_manager.finalize_evolution_file(self.evolution_filepath)
+            summary["evolution_filepath"] = str(self.evolution_filepath)
+            summary["evolution_filename"] = evo_info.get("filename", "")
+            summary["evolution_rows"] = evo_info.get("rows", 0)
+        else:
+            summary["evolution_filepath"] = None
+            summary["evolution_rows"] = 0
+
+        if self.device_state_payload:
+            state_path = self.csv_manager.write_device_state_json(
+                self.session_id, self.device_state_payload
+            )
+            summary["state_filepath"] = str(state_path)
+        else:
+            summary["state_filepath"] = None
 
         # Augment with session info
         duration = (self.end_time - self.start_time).total_seconds()
         logical = self.source_device_name or self.device_name
+        if (
+            logical == "ECHO_DEVICE"
+            and isinstance(self.metadata, dict)
+            and self.metadata.get("bleDeviceName")
+        ):
+            logical = str(self.metadata.get("bleDeviceName"))
         summary.update({
             "session_id": self.session_id,
             "device_name": logical,
@@ -179,7 +279,9 @@ class UploadSession:
 
         logger.info(
             f"[Session {self.session_id}] Upload complete: "
-            f"{summary['rows_saved']} rows in {duration:.1f}s"
+            f"{summary.get('rows_saved', 0)} CSV rows, "
+            f"{summary.get('evolution_rows', 0)} evolution event(s), "
+            f"state={'yes' if summary.get('state_filepath') else 'no'} in {duration:.1f}s"
         )
 
         return summary
@@ -206,7 +308,8 @@ class UploadHandler:
     """
     Manages ECHO device upload protocol:
     1. Device sends: "BEGIN_UPLOAD"
-    2. Device sends: CSV data lines
+    2. Device sends: optional "ECHO_JSON_META:" line, optional "ECHO_STATE_JSON:" + JSON,
+       encounter CSV lines, optional "ECHO_EVOLUTION_JSON:" + JSON per line
     3. Device sends: "END_UPLOAD"
     """
 
@@ -242,7 +345,7 @@ class UploadHandler:
         Process a message from a device
         Returns True if message was handled successfully
         """
-        message = message.strip()
+        message = normalize_ble_upload_text(message)
 
         # Suppress empty messages
         if not message:
@@ -319,6 +422,11 @@ class UploadHandler:
 
         summary = session.finish()
         self._cleanup_session(session.session_id)
+        if not summary:
+            logger.warning(
+                f"Device '{device_name}' ended upload with no stored CSV or evolution data"
+            )
+            return True
         self.completed_sessions.append(summary)
 
         self._trigger_callback(

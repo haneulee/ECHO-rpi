@@ -151,6 +151,9 @@ class Characteristic(dbus.service.Object):
         try:
             data = bytes(value)
             text = data.decode("utf-8").strip()
+            # Strip BOM / leading NUL so ECHO_* prefix lines match upload_handler (otherwise
+            # lines look like "ECHO_STATE_JSON:..." in logs but startswith fails → "malformed").
+            text = text.lstrip("\ufeff\x00\u200b\u200c\u200d\u2060")
             logger.debug(f"WriteValue: {text}")
 
             if self.value_callback:

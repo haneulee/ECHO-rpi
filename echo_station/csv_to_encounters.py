@@ -64,9 +64,20 @@ def _wall_time_for_row(
     return session_start + delta
 
 
-def _iso(dt: datetime) -> str:
+def _local_tz():
+    """Interpret naive Pi datetimes in the station's local timezone."""
+    return datetime.now().astimezone().tzinfo
+
+
+def _ensure_aware(dt: datetime) -> datetime:
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        return dt.replace(tzinfo=_local_tz())
+    return dt
+
+
+def _iso(dt: datetime) -> str:
+    """UTC Z suffix (DB / API friendly). Naive times = Pi local clock."""
+    dt = _ensure_aware(dt)
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
@@ -89,7 +100,8 @@ def _read_csv_rows(filepath: Path) -> List[CsvRow]:
         for i, parts in enumerate(reader):
             if not parts or len(parts) < 8:
                 continue
-            if i == 0 and ",".join(parts).strip() == CSV_HEADER.strip():
+            joined = ",".join(parts).strip()
+            if i == 0 and joined == CSV_HEADER.strip():
                 continue
             if len(parts) != 8:
                 continue
@@ -159,6 +171,7 @@ def csv_file_to_encounters(
             continue
         start_row = acc[0]
         end_row = acc[-1]
+        other_model_name = start_row.target
         t0 = start_row.ts_ms
         t1 = end_row.ts_ms
         duration_ms = max(0, t1 - t0)
@@ -173,16 +186,16 @@ def csv_file_to_encounters(
         closeness_avg = sum(closes) / len(closes) if closes else 0.0
 
         other_type = _TYPE_MAP.get(start_row.type_raw.upper(), "shy")
-        started_at = _iso(
-            _wall_time_for_row(
-                t0, min_ts, max_ts, session_start, session_end
-            )
-        )
-        ended_at = _iso(
+        # Map only the session *end* into the Pi upload window; set start from durationSec
+        # so ISO times stay consistent with duration (avoids compressing 56s into 1s wall).
+        ended_dt = _ensure_aware(
             _wall_time_for_row(
                 t1, min_ts, max_ts, session_start, session_end
             )
         )
+        started_dt = ended_dt - timedelta(seconds=float(duration_sec))
+        started_at = _iso(started_dt)
+        ended_at = _iso(ended_dt)
 
         enc_id = str(
             uuid.uuid5(
@@ -195,7 +208,8 @@ def csv_file_to_encounters(
             {
                 "id": enc_id,
                 "deviceId": device_id,
-                "otherEchoHash": _other_echo_hash(start_row.target),
+                "otherEchoHash": _other_echo_hash(other_model_name),
+                "otherEchoModelName": other_model_name,
                 "otherEchoType": other_type,
                 "startedAt": started_at,
                 "endedAt": ended_at,

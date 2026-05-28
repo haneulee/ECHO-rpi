@@ -13,6 +13,9 @@ BASE_DIR = Path(__file__).parent.parent
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
+SOUND_DIR = BASE_DIR / "sounds"
+SOUND_DIR.mkdir(exist_ok=True)
+
 # =====================================================
 # BLE UUIDs
 # =====================================================
@@ -82,3 +85,33 @@ ECHO_SOUND_PROFILE_ID = os.environ.get(
     "ambient3_meditation_v1",
 ).strip()
 ECHO_INGEST_TIMEOUT_SEC = float(os.environ.get("ECHO_INGEST_TIMEOUT_SEC", "60"))
+
+# =====================================================
+# DAILY SOUND (local render + playback + browser endpoint)
+# =====================================================
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# After an upload with encounter rows, render today's CSV files into sounds/today.wav.
+ECHO_DAILY_SOUND_ENABLED = _env_bool("ECHO_DAILY_SOUND_ENABLED", True)
+# Play the generated WAV through the Pi's default audio output. For Bluetooth,
+# pair/connect the speaker and make it the default sink.
+ECHO_DAILY_SOUND_AUTOPLAY = _env_bool("ECHO_DAILY_SOUND_AUTOPLAY", True)
+ECHO_DAILY_SOUND_DURATION_SEC = float(
+    os.environ.get("ECHO_DAILY_SOUND_DURATION_SEC", "45")
+)
+# Optional command template, e.g. 'paplay {path}' or 'aplay -q {path}'.
+ECHO_SOUND_PLAY_COMMAND = os.environ.get("ECHO_SOUND_PLAY_COMMAND", "").strip()
+
+# Lightweight local web playback:
+#   http://<raspberry-pi-ip>:8765/         browser player
+#   http://<raspberry-pi-ip>:8765/today.wav raw WAV
+ECHO_DAILY_SOUND_WEB_ENABLED = _env_bool("ECHO_DAILY_SOUND_WEB_ENABLED", True)
+ECHO_SOUND_WEB_HOST = os.environ.get("ECHO_SOUND_WEB_HOST", "0.0.0.0").strip()
+ECHO_SOUND_WEB_PORT = int(os.environ.get("ECHO_SOUND_WEB_PORT", "8765"))
