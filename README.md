@@ -9,9 +9,6 @@ A Python BLE GATT server that listens for ECHO ESP32 personality devices to uplo
 - Advertises a GATT service over BLE
 - Receives CSV-formatted encounter logs from ECHO devices
 - Saves data to timestamped CSV files in the `logs/` directory
-- Renders a "today's sound" WAV from the day's encounter data after each upload
-- Optionally auto-plays the sound through the Pi's default audio output
-- Serves the latest daily sound at a local browser URL
 - Handles multi-device connections and uploads
 - Provides console logging and progress tracking
 
@@ -69,38 +66,6 @@ Edit [echo_station/config.py](echo_station/config.py) to customize:
 - **LOG_DIR**: Output directory for CSV files (default: `./logs/`)
 - **LOG_LEVEL**: Verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`)
 - **UPLOAD_SESSION_TIMEOUT**: Maximum duration (seconds) for a single upload session; default is set very high so uploads rarely time out
-
-## Today's Sound Playback
-
-After an ESP32 finishes a dock upload with encounter rows, the station rebuilds a deterministic WAV from all of today's `encounter_*.csv` files:
-
-- File output: `sounds/today.wav` and `sounds/daily_echo_YYYY-MM-DD.wav`
-- Browser player: `http://<raspberry-pi-ip>:8765/`
-- Raw audio URL: `http://<raspberry-pi-ip>:8765/today.wav`
-- API status: `http://<raspberry-pi-ip>:8765/api/today-sound`
-
-For automatic playback, pair/connect the Bluetooth speaker on Raspberry Pi OS and make it the default audio output. The station tries `paplay`, then `pw-play`, then `aplay`. If your speaker needs a specific command, set:
-
-```bash
-ECHO_SOUND_PLAY_COMMAND=paplay {path}
-```
-
-Useful optional settings in `/etc/echo-station.env`:
-
-```bash
-ECHO_DAILY_SOUND_ENABLED=true
-ECHO_DAILY_SOUND_AUTOPLAY=true
-ECHO_DAILY_SOUND_DURATION_SEC=45
-ECHO_DAILY_SOUND_WEB_ENABLED=true
-ECHO_SOUND_WEB_HOST=0.0.0.0
-ECHO_SOUND_WEB_PORT=8765
-```
-
-Restart the service after changing these values:
-
-```bash
-sudo systemctl restart echo-station.service
-```
 
 ## Usage
 
@@ -224,10 +189,13 @@ The ECHO upload protocol follows this sequence:
 3. **Device sends** (recommended): one line `ECHO_JSON_META:` + JSON object with `echoUnitCode` (web signup / `EchoDevice.id`), `bleDeviceName` (`MY_NAME`), and `echoModelType` (`shy` \| `messy` \| `bounce`). This line is **not** written to the CSV file.
 4. **Device sends** (recommended): `ECHO_STATE_JSON:` + JSON snapshot (`profileSnapshot`, `soundProfileId`, …) — not written to the encounter CSV
 5. **Device sends** (optional): CSV data lines (one per write operation) when encounter data exists
-6. **Device sends** (optional): `ECHO_EVOLUTION_JSON:` + one JSON object per evolution event (not written to the encounter CSV)
-7. **Device sends**: `END_UPLOAD` marker
-8. **Server finalizes** encounter CSV, evolution JSONL, and state JSON (if any), logs summary, and (if configured) **POST**s to the Next.js ingest API
-9. **Connection closes**
+6. **Device sends** (optional): `ECHO_ENCOUNTER_SONIC_JSON:` + one JSON object per completed encounter session — peer `profileSnapshot` captured over BLE at `lost` (not written to the encounter CSV)
+7. **Device sends** (optional): `ECHO_EVOLUTION_JSON:` + one JSON object per evolution event (not written to the encounter CSV)
+8. **Device sends**: `END_UPLOAD` marker
+9. **Server finalizes** encounter CSV, encounter-sonic JSONL, evolution JSONL, and state JSON (if any), logs summary, and (if configured) **POST**s to the Next.js ingest API
+10. **Connection closes**
+
+While scanning, each ECHO advertises a compact sonic snapshot in BLE manufacturer data (`melodySemi[8]`, `brightness`, `calmness`, `densityBias`). On `lost`, the listening device stores that peer snapshot and uploads it with the dock session. Cloud ingest merges it into each Encounter as `otherEchoProfileSnapshot` (plus `otherEchoSonicSource`: `ble_adv` \| `factory_default`).
 
 The server handles:
 - **Multi-device uploads**: Each device gets its own session and CSV file
@@ -244,7 +212,7 @@ After each successful upload, the station can **POST** JSON encounters (`POST /a
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `ECHO_APP_URL` | with ingest | Base URL, e.g. `https://your-app.vercel.app` (no trailing slash) |
+| `ECHO_APP_URL` | with ingest | Base URL, e.g. `https://www.myecho.ch` (no trailing slash; apex `myecho.ch` 308-redirects to www) |
 | `ECHO_INGEST_SECRET` | with ingest | Same value as server `INGEST_SECRET` |
 | `ECHO_SOUND_PROFILE_ID` | no | Defaults to `ambient3_meditation_v1` |
 | `ECHO_INGEST_TIMEOUT_SEC` | no | HTTP timeout (default `60`) |
@@ -256,13 +224,19 @@ If either `ECHO_APP_URL` or `ECHO_INGEST_SECRET` is missing, cloud ingest is ski
 The unit file includes `EnvironmentFile=-/etc/echo-station.env`. **`./install-echo-station-service.sh`** copies `echo-station.env.example` to `/etc/echo-station.env` **only if that file does not exist** (then edit secrets). You can also create it manually (root-readable only):
 
 ```
-ECHO_APP_URL=https://your-app.vercel.app
+ECHO_APP_URL=https://www.myecho.ch
 ECHO_INGEST_SECRET=your-ingest-secret
 ```
 
 Then `sudo systemctl restart echo-station.service`.
 
 Re-run `./install-echo-station-service.sh` after pulling changes so the updated unit file is installed.
+
+To switch cloud ingest to the production domain (`https://www.myecho.ch`) on an existing Pi:
+
+```bash
+cd ECHO-rpi && ./scripts/set-app-url-myecho.sh
+```
 
 ### Behaviour
 
@@ -279,7 +253,6 @@ ECHO-rpi/
 │   ├── csv_manager.py           # File I/O and CSV handling
 │   ├── csv_to_encounters.py     # CSV → ingest Encounter JSON
 │   ├── cloud_ingest.py          # HTTPS POST ingest (encounters + evolutions)
-│   ├── daily_sound.py           # Today's WAV render, autoplay, and web playback
 │   ├── evolution_ingest.py      # evolution.jsonl → API payloads
 │   ├── echo_unit_code.py        # Normalize unit codes (match web app)
 │   ├── upload_handler.py        # Protocol state machine
@@ -375,6 +348,9 @@ sudo systemctl start dbus
 2. Check logs for errors:
    ```bash
    tail -f logs/station.log
+   # If grep says "binary file matches", use -a or repair NUL bytes:
+   grep -a "Cloud ingest enabled" logs/station.log | tail -1
+   sudo ./scripts/repair-station-log.sh
    ```
 
 3. Verify ESP32 is configured with matching UUIDs in firmware

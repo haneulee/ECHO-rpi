@@ -29,26 +29,19 @@ from .config import (
     ECHO_INGEST_SECRET,
     ECHO_SOUND_PROFILE_ID,
     ECHO_INGEST_TIMEOUT_SEC,
-    ECHO_DAILY_SOUND_ENABLED,
-    ECHO_DAILY_SOUND_AUTOPLAY,
-    ECHO_DAILY_SOUND_DURATION_SEC,
-    ECHO_DAILY_SOUND_WEB_ENABLED,
-    ECHO_SOUND_PLAY_COMMAND,
-    ECHO_SOUND_WEB_HOST,
-    ECHO_SOUND_WEB_PORT,
 )
 from .ble_server import BLEServer
 from .upload_handler import UploadHandler
 from .csv_manager import CSVManager
 from .csv_to_encounters import csv_file_to_encounters, resolve_device_id
-from .cloud_ingest import post_encounters, post_evolutions, post_echo_state
+from .cloud_ingest import (
+    normalize_app_url,
+    post_encounters,
+    post_evolutions,
+    post_echo_state,
+)
 from .evolution_ingest import evolution_jsonl_to_payloads
 from .state_ingest import echo_state_file_to_api_payload
-from .daily_sound import (
-    play_sound_file,
-    render_daily_sound,
-    start_sound_web_server,
-)
 
 
 def setup_logging(log_level=LOG_LEVEL, log_file=LOG_FILE, log_to_file=True):
@@ -64,7 +57,13 @@ def setup_logging(log_level=LOG_LEVEL, log_file=LOG_FILE, log_to_file=True):
     # File handler (optional)
     file_handler = None
     if log_to_file:
-        file_handler = logging.FileHandler(log_file)
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(
+            log_path,
+            mode="a",
+            encoding="utf-8",
+        )
         file_handler.setFormatter(formatter)
 
     # Root logger
@@ -87,7 +86,6 @@ class EchoStation:
         self.upload_handler = UploadHandler(self.csv_manager)
         self.ble_server = None
         self.main_loop = None
-        self.sound_web_server = None
         self.running = False
         self.startup_failed = False
 
@@ -133,24 +131,16 @@ class EchoStation:
 
         self.logger.info("Station setup complete")
         if ECHO_APP_URL and ECHO_INGEST_SECRET:
+            ingest_base = normalize_app_url(ECHO_APP_URL)
             self.logger.info(
-                "Cloud ingest enabled → %s/api/ingest/{encounters,evolutions,echo-state}",
-                ECHO_APP_URL,
+                "Cloud ingest enabled -> %s/api/ingest/{encounters,evolutions,echo-state}",
+                ingest_base,
             )
         elif ECHO_APP_URL or ECHO_INGEST_SECRET:
             self.logger.warning(
                 "Cloud ingest partially configured: set both ECHO_APP_URL and "
                 "ECHO_INGEST_SECRET to enable POST after each upload."
             )
-        if ECHO_DAILY_SOUND_WEB_ENABLED:
-            try:
-                self.sound_web_server = start_sound_web_server(
-                    ECHO_SOUND_WEB_HOST,
-                    ECHO_SOUND_WEB_PORT,
-                    log=self.logger,
-                )
-            except OSError as e:
-                self.logger.error("Daily sound web server failed to start: %s", e)
         return True
 
     def _complete_ble_setup(self) -> bool:
@@ -211,44 +201,12 @@ class EchoStation:
             f"  File: {summary.get('filename', 'unknown')}\n"
             f"  Evolution: {summary.get('evolution_rows', 0)} row(s)"
             f" → {summary.get('evolution_filename') or 'none'}\n"
+            f"  Encounter sonic: {summary.get('encounter_sonic_rows', 0)} row(s)"
+            f" → {summary.get('encounter_sonic_filename') or 'none'}\n"
             f"  State: {summary.get('state_filepath') or 'none'}\n"
             f"  Duration: {summary.get('duration_seconds', 0):.1f}s"
         )
         self._maybe_post_cloud_ingest(summary)
-        self._maybe_render_daily_sound(summary)
-
-    def _maybe_render_daily_sound(self, summary: dict) -> None:
-        if not ECHO_DAILY_SOUND_ENABLED:
-            return
-
-        rows_saved = int(summary.get("rows_saved", 0) or 0)
-        if rows_saved <= 0:
-            self.logger.info("Daily sound skipped: upload had no encounter rows")
-            return
-
-        try:
-            result = render_daily_sound(duration_sec=ECHO_DAILY_SOUND_DURATION_SEC)
-        except Exception as e:
-            self.logger.exception("Daily sound render failed: %s", e)
-            return
-
-        if not result:
-            self.logger.info("Daily sound skipped: no encounter rows found for today")
-            return
-
-        self.logger.info(
-            "Daily sound rendered: %s (%d row(s), avg closeness %.2f)",
-            result.today_path,
-            result.rows_used,
-            result.avg_closeness,
-        )
-
-        if ECHO_DAILY_SOUND_AUTOPLAY:
-            play_sound_file(
-                result.today_path,
-                command_template=ECHO_SOUND_PLAY_COMMAND,
-                log=self.logger,
-            )
 
     def _maybe_post_cloud_ingest(self, summary: dict) -> None:
         if not ECHO_APP_URL or not ECHO_INGEST_SECRET:
@@ -256,9 +214,12 @@ class EchoStation:
 
         fp = (summary.get("filepath") or "").strip()
         evo_fp = summary.get("evolution_filepath")
+        sonic_fp = summary.get("encounter_sonic_filepath")
         state_fp = (summary.get("state_filepath") or "").strip()
-        if not fp and not evo_fp and not state_fp:
-            self.logger.info("Cloud ingest skipped: no CSV, evolution, or state file")
+        if not fp and not evo_fp and not sonic_fp and not state_fp:
+            self.logger.info(
+                "Cloud ingest skipped: no CSV, evolution, encounter sonic, or state file"
+            )
             return
 
         enc_path = Path(fp) if fp else None
@@ -271,12 +232,19 @@ class EchoStation:
             self.logger.warning("Cloud ingest: evolution file missing %s", evo_path)
             evo_path = None
 
+        sonic_path = Path(sonic_fp) if sonic_fp else None
+        if sonic_path and not sonic_path.is_file():
+            self.logger.warning(
+                "Cloud ingest: encounter sonic file missing %s", sonic_path
+            )
+            sonic_path = None
+
         state_path = Path(state_fp) if state_fp else None
         if state_path and not state_path.is_file():
             self.logger.warning("Cloud ingest: state file missing %s", state_path)
             state_path = None
 
-        if not enc_path and not evo_path and not state_path:
+        if not enc_path and not evo_path and not sonic_path and not state_path:
             return
 
         meta = summary.get("upload_metadata")
@@ -307,6 +275,7 @@ class EchoStation:
                     session_start=session_start,
                     session_end=session_end,
                     sound_profile_id=ECHO_SOUND_PROFILE_ID,
+                    encounter_sonic_jsonl=sonic_path,
                 )
             except Exception as e:
                 self.logger.exception("Cloud ingest: failed to build encounters: %s", e)
@@ -430,11 +399,6 @@ class EchoStation:
 
         if self.ble_server:
             self.ble_server.stop()
-
-        if self.sound_web_server:
-            self.sound_web_server.shutdown()
-            self.sound_web_server.server_close()
-            self.sound_web_server = None
 
         if self.main_loop:
             self.main_loop.quit()

@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 META_PREFIX = "ECHO_JSON_META:"
 EVO_PREFIX = "ECHO_EVOLUTION_JSON:"
+SONIC_PREFIX = "ECHO_ENCOUNTER_SONIC_JSON:"
 STATE_PREFIX = "ECHO_STATE_JSON:"
 
 # Some BLE→text paths prepend BOM/NUL/zero-width chars so the line *looks* like
@@ -69,6 +70,8 @@ class UploadSession:
         self.metadata: Optional[Dict[str, Any]] = None
         self.evolution_filepath: Optional[Path] = None
         self.evolution_row_count = 0
+        self.encounter_sonic_filepath: Optional[Path] = None
+        self.encounter_sonic_row_count = 0
         self.device_state_payload: Optional[Dict[str, Any]] = None
 
     def start(self) -> bool:
@@ -84,6 +87,8 @@ class UploadSession:
             self.metadata = None
             self.evolution_filepath = None
             self.evolution_row_count = 0
+            self.encounter_sonic_filepath = None
+            self.encounter_sonic_row_count = 0
             self.device_state_payload = None
             logger.info(
                 f"[Session {self.session_id}] Upload session open "
@@ -159,6 +164,35 @@ class UploadSession:
             self.error_count += 1
             return False
 
+        if stripped.startswith(SONIC_PREFIX):
+            payload = stripped[len(SONIC_PREFIX) :].strip()
+            try:
+                parsed = json.loads(payload)
+                if not isinstance(parsed, dict):
+                    raise ValueError("encounter sonic JSON must be an object")
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(
+                    f"[Session {self.session_id}] Invalid encounter sonic JSON: {e}"
+                )
+                self.error_count += 1
+                return False
+            if self.encounter_sonic_filepath is None:
+                self.encounter_sonic_filepath = (
+                    self.csv_manager.initialize_encounter_sonic_file(self.session_id)
+                )
+                logger.info(
+                    f"[Session {self.session_id}] Encounter sonic log: "
+                    f"{self.encounter_sonic_filepath.name}"
+                )
+            if self.csv_manager.append_encounter_sonic_json_line(
+                self.encounter_sonic_filepath,
+                json.dumps(parsed, separators=(",", ":")),
+            ):
+                self.encounter_sonic_row_count += 1
+                return True
+            self.error_count += 1
+            return False
+
         if stripped.startswith(STATE_PREFIX):
             payload = stripped[len(STATE_PREFIX) :].strip()
             try:
@@ -222,7 +256,12 @@ class UploadSession:
         self.state = UploadState.COMPLETE
         self.end_time = datetime.now()
 
-        if not self.filepath and not self.evolution_filepath and not self.device_state_payload:
+        if (
+            not self.filepath
+            and not self.evolution_filepath
+            and not self.encounter_sonic_filepath
+            and not self.device_state_payload
+        ):
             logger.warning(
                 f"[Session {self.session_id}] Upload finished with no CSV, evolution, or state"
             )
@@ -248,6 +287,17 @@ class UploadSession:
         else:
             summary["evolution_filepath"] = None
             summary["evolution_rows"] = 0
+
+        if self.encounter_sonic_filepath:
+            sonic_info = self.csv_manager.finalize_encounter_sonic_file(
+                self.encounter_sonic_filepath
+            )
+            summary["encounter_sonic_filepath"] = str(self.encounter_sonic_filepath)
+            summary["encounter_sonic_filename"] = sonic_info.get("filename", "")
+            summary["encounter_sonic_rows"] = sonic_info.get("rows", 0)
+        else:
+            summary["encounter_sonic_filepath"] = None
+            summary["encounter_sonic_rows"] = 0
 
         if self.device_state_payload:
             state_path = self.csv_manager.write_device_state_json(

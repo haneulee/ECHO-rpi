@@ -15,6 +15,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .config import CSV_HEADER
 from .echo_unit_code import normalize_echo_unit_code
+from .encounter_sonic_ingest import (
+    load_encounter_sonic_jsonl,
+    match_sonic_for_session,
+    profile_snapshot_from_sonic_row,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +132,7 @@ def csv_file_to_encounters(
     session_start: datetime,
     session_end: datetime,
     sound_profile_id: str,
+    encounter_sonic_jsonl: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
     """
     device_id: normalized Echo unit code for ingest (EchoDevice.id / serialNumber).
@@ -134,6 +140,8 @@ def csv_file_to_encounters(
     data_rows = _read_csv_rows(filepath)
     if not data_rows:
         return []
+
+    sonic_rows = load_encounter_sonic_jsonl(encounter_sonic_jsonl)
 
     min_ts = min(r.ts_ms for r in data_rows)
     max_ts = max(r.ts_ms for r in data_rows)
@@ -204,24 +212,36 @@ def csv_file_to_encounters(
             )
         )
 
-        out.append(
-            {
-                "id": enc_id,
-                "deviceId": device_id,
-                "otherEchoHash": _other_echo_hash(other_model_name),
-                "otherEchoModelName": other_model_name,
-                "otherEchoType": other_type,
-                "startedAt": started_at,
-                "endedAt": ended_at,
-                "durationSec": duration_sec,
-                "rssiAvg": round(rssi_avg, 2),
-                "rssiMin": int(round(rssi_min)),
-                "rssiMax": int(round(rssi_max)),
-                "closenessAvg": round(closeness_avg, 4),
-                "proximityZone": _proximity_zone(closeness_avg),
-                "soundProfileId": sound_profile_id,
-            }
+        enc_obj: Dict[str, Any] = {
+            "id": enc_id,
+            "deviceId": device_id,
+            "otherEchoHash": _other_echo_hash(other_model_name),
+            "otherEchoModelName": other_model_name,
+            "otherEchoType": other_type,
+            "startedAt": started_at,
+            "endedAt": ended_at,
+            "durationSec": duration_sec,
+            "rssiAvg": round(rssi_avg, 2),
+            "rssiMin": int(round(rssi_min)),
+            "rssiMax": int(round(rssi_max)),
+            "closenessAvg": round(closeness_avg, 4),
+            "proximityZone": _proximity_zone(closeness_avg),
+            "soundProfileId": sound_profile_id,
+        }
+
+        sonic_row = match_sonic_for_session(
+            sonic_rows,
+            target=other_model_name,
+            t0_ms=t0,
+            t1_ms=t1,
         )
+        snap = profile_snapshot_from_sonic_row(sonic_row)
+        if snap:
+            enc_obj["otherEchoProfileSnapshot"] = snap
+        if sonic_row and sonic_row.get("sonicSource"):
+            enc_obj["otherEchoSonicSource"] = str(sonic_row.get("sonicSource"))
+
+        out.append(enc_obj)
 
     return out
 

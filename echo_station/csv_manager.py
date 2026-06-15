@@ -154,6 +154,38 @@ class CSVManager:
             logger.error(f"Failed to append evolution line: {e}")
             return False
 
+    def initialize_encounter_sonic_file(self, session_id: str) -> Path:
+        """Create an empty JSONL file for per-encounter peer sonic snapshots."""
+        now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        safe = session_id.replace(" ", "_").replace("/", "_")
+        filename = f"encounter_sonic_{safe}_{now}.jsonl"
+        filepath = self.log_dir / filename
+        filepath.touch()
+        logger.info("Created encounter sonic JSONL: %s", filepath)
+        return filepath
+
+    def append_encounter_sonic_json_line(self, filepath: Path, json_line: str) -> bool:
+        try:
+            with open(filepath, "a", encoding="utf-8") as f:
+                f.write(json_line.strip() + "\n")
+            return True
+        except IOError as e:
+            logger.error("Failed to append encounter sonic line: %s", e)
+            return False
+
+    def finalize_encounter_sonic_file(self, filepath: Path) -> Dict[str, any]:
+        try:
+            n = 0
+            if filepath.is_file():
+                with open(filepath, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if line.strip():
+                            n += 1
+            return {"rows": n, "filepath": str(filepath), "filename": filepath.name}
+        except OSError as e:
+            logger.error("finalize encounter sonic: %s", e)
+            return {"rows": 0, "filepath": str(filepath), "error": str(e)}
+
     def finalize_evolution_file(self, filepath: Path) -> Dict[str, any]:
         try:
             n = 0

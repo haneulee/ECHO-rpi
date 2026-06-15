@@ -27,8 +27,6 @@ pip-delete-this-directory.txt
 # Runtime logs & exports (station / Copilot)
 logs/*
 !logs/.gitkeep
-sounds/*
-!sounds/.gitkeep
 
 # Test / tooling
 .pytest_cache/
